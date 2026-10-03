@@ -18,7 +18,11 @@
         "android.permission.BLUETOOTH",
         "android.permission.BLUETOOTH_ADMIN",
         "android.permission.BLUETOOTH_CONNECT"
-      ]
+      ],
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#0f172a"
+      }
     },
     "plugins": [
       [
@@ -37,6 +41,15 @@
         "projectId": "4550a434-bddb-4c1d-8be7-d234e949334e"
       }
     },
-    "owner": "bkwint"
+    "owner": "bkwint",
+    "icon": "./assets/icon.png",
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#0f172a"
+    }
   }
 }

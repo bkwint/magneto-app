@@ -136,6 +136,7 @@ export default function App() {
   const [renameBusy, setRenameBusy] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
   const renamingRef = useRef(false);
+  const pendingRenameRef = useRef(false); // iOS: open rename after the menu modal is gone
 
   const monitorSub = useRef<Subscription | null>(null);
   const disconnectSub = useRef<Subscription | null>(null);
@@ -398,10 +399,16 @@ export default function App() {
   }, []);
 
   const openRename = useCallback(() => {
-    setMenuOpen(false);
     setRenameText(displayName ?? '');
     setRenameError(null);
-    setRenameOpen(true);
+    if (Platform.OS === 'ios') {
+      // iOS can't present a modal while another one is still dismissing
+      pendingRenameRef.current = true;
+      setMenuOpen(false);
+    } else {
+      setMenuOpen(false);
+      setRenameOpen(true);
+    }
   }, [displayName]);
 
   useEffect(() => {
@@ -549,6 +556,12 @@ export default function App() {
           animationType="fade"
           statusBarTranslucent
           onRequestClose={() => setMenuOpen(false)}
+          onDismiss={() => {
+            if (pendingRenameRef.current) {
+              pendingRenameRef.current = false;
+              setRenameOpen(true);
+            }
+          }}
         >
           <Pressable style={styles.menuBackdrop} onPress={() => setMenuOpen(false)}>
             <View style={[styles.dropdown, { top: menuTop }]}>
@@ -565,11 +578,19 @@ export default function App() {
           </Pressable>
         </Modal>
 
-        {/* Rename dialog */}
-        {renameOpen && (
+        {/* Rename dialog: floating modal that moves up with the keyboard */}
+        <Modal
+          transparent
+          visible={renameOpen}
+          animationType="fade"
+          statusBarTranslucent
+          onRequestClose={() => {
+            if (!renameBusy) setRenameOpen(false);
+          }}
+        >
           <KeyboardAvoidingView
             style={styles.overlay}
-            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+            behavior={Platform.OS === 'ios' ? 'padding' : 'height'}
           >
             <View style={styles.dialog}>
               <Text style={styles.dialogTitle}>Rename device</Text>
@@ -621,7 +642,7 @@ export default function App() {
               </View>
             </View>
           </KeyboardAvoidingView>
-        )}
+        </Modal>
       </SafeAreaView>
     </SafeAreaProvider>
   );
@@ -708,7 +729,7 @@ const styles = StyleSheet.create({
   unit: { fontSize: 28, color: '#94a3b8', fontWeight: '500' },
   updated: { color: '#64748b', fontSize: 12 },
   overlay: {
-    ...StyleSheet.absoluteFillObject,
+    flex: 1,
     backgroundColor: 'rgba(0,0,0,0.65)',
     justifyContent: 'center',
     paddingHorizontal: 20,
