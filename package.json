@@ -6,6 +6,7 @@
     "base-64": "^1.0.0",
     "eas-cli": "^24.10.0",
     "expo": "~57.0.26",
+    "expo-dev-client": "~57.0.19",
     "expo-status-bar": "~57.0.1",
     "react": "19.2.3",
     "react-native": "0.86.3",
