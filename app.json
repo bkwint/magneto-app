@@ -1,25 +1,29 @@
 {
   "expo": {
-    "name": "magneto-ble",
+    "name": "Magneto BLE",
     "slug": "magneto-ble",
     "version": "1.0.0",
     "orientation": "portrait",
-    "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "userInterfaceStyle": "dark",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": false,
+      "bundleIdentifier": "com.example.magnetoble",
+      "infoPlist": {
+        "NSBluetoothAlwaysUsageDescription": "Bluetooth is used to connect to your magnetic field sensor."
+      }
     },
     "android": {
-      "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/android-icon-foreground.png",
-        "backgroundImage": "./assets/android-icon-background.png",
-        "monochromeImage": "./assets/android-icon-monochrome.png"
-      },
-      "predictiveBackGestureEnabled": false
+      "package": "com.example.magnetoble"
     },
-    "web": {
-      "favicon": "./assets/favicon.png"
-    }
+    "plugins": [
+      [
+        "react-native-ble-plx",
+        {
+          "isBackgroundEnabled": false,
+          "modes": ["central"],
+          "bluetoothAlwaysPermission": "Bluetooth is used to connect to your magnetic field sensor."
+        }
+      ]
+    ]
   }
 }
