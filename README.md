@@ -35,3 +35,8 @@ The simulator/emulator has no Bluetooth, so use a real phone.
 - Tap a device to connect, read the characteristic once, then subscribe to notifications (your sketch notifies every 200 ms).
 - The sketch sends the value as ASCII text, so it's base64-decoded and parsed with `parseFloat`.
 - If the device drops, the app returns to the scan screen.
+
+## Which hardware
+
+This app works with the custom hardware build with an esp32 c3 super mini and an adafruit MLX90393 breakoutboard. 
+For the software for this custom hardware you can check this [github repository](https://github.com/bkwint/esp32-magnetometer)
