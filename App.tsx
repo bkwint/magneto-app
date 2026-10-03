@@ -19,6 +19,8 @@ import { decode } from 'base-64';
 const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
 const CHARACTERISTIC_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
 
+const TARE_SAMPLES = 5;
+
 // Single manager instance for the whole app
 const manager = new BleManager();
 
@@ -59,12 +61,24 @@ export default function App() {
   const [devices, setDevices] = useState<Device[]>([]);
   const [showAll, setShowAll] = useState(false);
   const [connected, setConnected] = useState<Device | null>(null);
-  const [value, setValue] = useState<number | null>(null);
+  // rawValue is exactly what the sensor sent; the displayed value is rawValue - offset
+  const [rawValue, setRawValue] = useState<number | null>(null);
+  const [offset, setOffset] = useState(0);
+  const [taring, setTaring] = useState(false);
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const monitorSub = useRef<Subscription | null>(null);
   const disconnectSub = useRef<Subscription | null>(null);
+
+  const value = rawValue !== null ? rawValue - offset : null;
+
+  const resetReading = useCallback(() => {
+    setRawValue(null);
+    setOffset(0);
+    setTaring(false);
+    setUpdatedAt(null);
+  }, []);
 
   const stopScan = useCallback(() => {
     manager.stopDeviceScan();
@@ -130,8 +144,7 @@ export default function App() {
         disconnectSub.current = d.onDisconnected(() => {
           cleanupConnection();
           setConnected(null);
-          setValue(null);
-          setUpdatedAt(null);
+          resetReading();
           setStatus('idle');
           setError('Device disconnected.');
         });
@@ -143,7 +156,7 @@ export default function App() {
         );
         const v0 = parseValue(initial.value);
         if (v0 !== null) {
-          setValue(v0);
+          setRawValue(v0);
           setUpdatedAt(new Date());
         }
 
@@ -161,12 +174,13 @@ export default function App() {
             }
             const v = parseValue(characteristic?.value ?? null);
             if (v !== null) {
-              setValue(v);
+              setRawValue(v);
               setUpdatedAt(new Date());
             }
           }
         );
 
+        setOffset(0); // fresh connection starts untared
         setConnected(d);
         setStatus('connected');
       } catch (e: any) {
@@ -175,7 +189,7 @@ export default function App() {
         setStatus('idle');
       }
     },
-    [cleanupConnection]
+    [cleanupConnection, resetReading]
   );
 
   const disconnect = useCallback(async () => {
@@ -187,10 +201,38 @@ export default function App() {
       // already disconnected
     }
     setConnected(null);
-    setValue(null);
-    setUpdatedAt(null);
+    resetReading();
     setStatus('idle');
-  }, [connected, cleanupConnection]);
+  }, [connected, cleanupConnection, resetReading]);
+
+  // Take TARE_SAMPLES raw readings from the sensor, average them, and use the
+  // average as the zero point for all following measurements.
+  const tare = useCallback(async () => {
+    if (!connected || taring) return;
+    setError(null);
+    setTaring(true);
+    try {
+      const samples: number[] = [];
+      for (let i = 0; i < TARE_SAMPLES; i++) {
+        const c = await connected.readCharacteristicForService(
+          SERVICE_UUID,
+          CHARACTERISTIC_UUID
+        );
+        const v = parseValue(c.value);
+        if (v !== null) samples.push(v);
+      }
+      if (samples.length === 0) {
+        setError('Tare failed: no valid readings received.');
+        return;
+      }
+      const avg = samples.reduce((a, b) => a + b, 0) / samples.length;
+      setOffset(avg);
+    } catch (e: any) {
+      setError(e?.message ?? 'Tare failed.');
+    } finally {
+      setTaring(false);
+    }
+  }, [connected, taring]);
 
   useEffect(() => {
     return () => {
@@ -199,15 +241,25 @@ export default function App() {
     };
   }, [cleanupConnection]);
 
+  const isConnected = status === 'connected' && connected;
+
   return (
     <SafeAreaProvider>
       <SafeAreaView style={styles.container}>
         <StatusBar barStyle="light-content" />
-        <Text style={styles.title}>Magneto Sensor</Text>
+
+        <View style={styles.header}>
+          <Text style={styles.title}>Magneto Sensor</Text>
+          {isConnected && (
+            <Pressable style={styles.disconnectBtn} onPress={disconnect}>
+              <Text style={styles.disconnectText}>Disconnect</Text>
+            </Pressable>
+          )}
+        </View>
 
         {error && <Text style={styles.error}>{error}</Text>}
 
-        {status === 'connected' && connected ? (
+        {isConnected ? (
           <View style={styles.readingWrap}>
             <Text style={styles.deviceName}>
               {connected.name ?? connected.localName ?? connected.id}
@@ -223,9 +275,23 @@ export default function App() {
                   ? `Updated ${updatedAt.toLocaleTimeString()}`
                   : 'Waiting for data…'}
               </Text>
+              {offset !== 0 && (
+                <Text style={styles.updated}>Tared (offset {offset.toFixed(5)} G)</Text>
+              )}
             </View>
-            <Pressable style={[styles.button, styles.danger]} onPress={disconnect}>
-              <Text style={styles.buttonText}>Disconnect</Text>
+            <Pressable
+              style={[styles.button, styles.tare, taring && styles.disabled]}
+              disabled={taring}
+              onPress={tare}
+            >
+              {taring ? (
+                <View style={styles.inline}>
+                  <ActivityIndicator color="#fff" />
+                  <Text style={[styles.buttonText, { marginLeft: 10 }]}>Taring…</Text>
+                </View>
+              ) : (
+                <Text style={styles.buttonText}>Tare</Text>
+              )}
             </Pressable>
           </View>
         ) : (
@@ -301,7 +367,20 @@ export default function App() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: '#0f172a', paddingHorizontal: 20 },
-  title: { color: '#f8fafc', fontSize: 26, fontWeight: '700', marginVertical: 16 },
+  header: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    alignItems: 'center',
+    marginVertical: 16,
+  },
+  title: { color: '#f8fafc', fontSize: 26, fontWeight: '700' },
+  disconnectBtn: {
+    backgroundColor: '#dc2626',
+    paddingVertical: 8,
+    paddingHorizontal: 14,
+    borderRadius: 8,
+  },
+  disconnectText: { color: '#fff', fontSize: 14, fontWeight: '600' },
   error: {
     color: '#fecaca',
     backgroundColor: '#7f1d1d',
@@ -324,7 +403,7 @@ const styles = StyleSheet.create({
     borderRadius: 10,
     alignItems: 'center',
   },
-  danger: { backgroundColor: '#dc2626', marginTop: 24 },
+  tare: { marginTop: 24 },
   disabled: { opacity: 0.5 },
   buttonText: { color: '#fff', fontSize: 16, fontWeight: '600' },
   hint: { color: '#94a3b8', marginTop: 12, textAlign: 'center' },

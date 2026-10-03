@@ -4,6 +4,7 @@
   "main": "index.ts",
   "dependencies": {
     "base-64": "^1.0.0",
+    "eas-cli": "^24.10.0",
     "expo": "~57.0.26",
     "expo-status-bar": "~57.0.1",
     "react": "19.2.3",
