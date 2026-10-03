@@ -2,6 +2,8 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
   FlatList,
+  KeyboardAvoidingView,
+  Modal,
   PermissionsAndroid,
   Platform,
   Pressable,
@@ -9,17 +11,20 @@ import {
   StyleSheet,
   Switch,
   Text,
+  TextInput,
   View,
 } from 'react-native';
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { BleManager, Device, State, Subscription } from 'react-native-ble-plx';
-import { decode } from 'base-64';
+import { decode, encode } from 'base-64';
 
 // Must match the UUIDs in the Arduino sketch
 const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
 const CHARACTERISTIC_UUID = 'beb5483e-36e1-4688-b7f5-ea07361b26a8';
+const NAME_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // device name (read/write)
 
 const TARE_SAMPLES = 5;
+const MAX_NAME_LEN = 29; // must match MAX_NAME_LEN in the Arduino sketch
 
 // Single manager instance for the whole app
 const manager = new BleManager();
@@ -56,17 +61,81 @@ function parseValue(base64: string | null): number | null {
   }
 }
 
+// UTF-8 <-> base64 helpers for the device name
+function toBase64Utf8(s: string): string {
+  return encode(unescape(encodeURIComponent(s)));
+}
+function fromBase64Utf8(b64: string | null): string | null {
+  if (!b64) return null;
+  try {
+    return decodeURIComponent(escape(decode(b64)));
+  } catch {
+    try {
+      return decode(b64);
+    } catch {
+      return null;
+    }
+  }
+}
+function utf8Length(s: string): number {
+  return unescape(encodeURIComponent(s)).length;
+}
+
+// Scan until the device with the given id shows up again (e.g. after it reboots)
+function findDevice(id: string, timeoutMs: number): Promise<Device> {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      manager.stopDeviceScan();
+      reject(
+        new Error('Could not find the device after renaming. Please scan again.')
+      );
+    }, timeoutMs);
+
+    manager.startDeviceScan(
+      [SERVICE_UUID],
+      { allowDuplicates: false },
+      (err, device) => {
+        if (err) {
+          clearTimeout(timer);
+          manager.stopDeviceScan();
+          reject(err);
+          return;
+        }
+        if (device && device.id === id) {
+          clearTimeout(timer);
+          manager.stopDeviceScan();
+          resolve(device);
+        }
+      }
+    );
+  });
+}
+
 export default function App() {
   const [status, setStatus] = useState<Status>('idle');
   const [devices, setDevices] = useState<Device[]>([]);
   const [showAll, setShowAll] = useState(false);
   const [connected, setConnected] = useState<Device | null>(null);
+  const [displayName, setDisplayName] = useState<string | null>(null);
   // rawValue is exactly what the sensor sent; the displayed value is rawValue - offset
   const [rawValue, setRawValue] = useState<number | null>(null);
   const [offset, setOffset] = useState(0);
   const [taring, setTaring] = useState(false);
   const [updatedAt, setUpdatedAt] = useState<Date | null>(null);
   const [error, setError] = useState<string | null>(null);
+
+  // Options dropdown
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [menuTop, setMenuTop] = useState(0);
+  const menuBtnRef = useRef<View>(null);
+
+  // Rename dialog
+  const [renameOpen, setRenameOpen] = useState(false);
+  const [renameText, setRenameText] = useState('');
+  const [renameError, setRenameError] = useState<string | null>(null);
+  const [renameBusy, setRenameBusy] = useState(false);
+  const [reconnecting, setReconnecting] = useState(false);
+  const renamingRef = useRef(false);
 
   const monitorSub = useRef<Subscription | null>(null);
   const disconnectSub = useRef<Subscription | null>(null);
@@ -142,12 +211,29 @@ export default function App() {
         await d.discoverAllServicesAndCharacteristics();
 
         disconnectSub.current = d.onDisconnected(() => {
+          // During a rename the device reboots on purpose; the rename flow handles it
+          if (renamingRef.current) return;
           cleanupConnection();
           setConnected(null);
           resetReading();
           setStatus('idle');
           setError('Device disconnected.');
         });
+
+        // Prefer the name stored on the device; fall back to the advertised name
+        let name =
+          d.name ?? d.localName ?? device.name ?? device.localName ?? d.id;
+        try {
+          const n = await d.readCharacteristicForService(
+            SERVICE_UUID,
+            NAME_CHAR_UUID
+          );
+          const stored = fromBase64Utf8(n.value);
+          if (stored) name = stored;
+        } catch {
+          // firmware without the name characteristic
+        }
+        setDisplayName(name);
 
         // Initial read so something shows immediately
         const initial = await d.readCharacteristicForService(
@@ -194,6 +280,7 @@ export default function App() {
 
   const disconnect = useCallback(async () => {
     if (!connected) return;
+    setMenuOpen(false);
     cleanupConnection();
     try {
       await manager.cancelDeviceConnection(connected.id);
@@ -234,6 +321,89 @@ export default function App() {
     }
   }, [connected, taring]);
 
+  // Write the new name, let the ESP32 reboot, then scan for it and reconnect
+  const renameDevice = useCallback(
+    async (newName: string) => {
+      if (!connected) return;
+      const id = connected.id;
+
+      setRenameBusy(true);
+      setRenameError(null);
+      renamingRef.current = true;
+
+      try {
+        await connected.writeCharacteristicWithResponseForService(
+          SERVICE_UUID,
+          NAME_CHAR_UUID,
+          toBase64Utf8(newName)
+        );
+      } catch (e: any) {
+        renamingRef.current = false;
+        setRenameError(e?.message ?? 'Failed to rename the device.');
+        setRenameBusy(false);
+        return;
+      }
+
+      setRenameBusy(false);
+      setRenameOpen(false);
+      setError(null);
+      setReconnecting(true);
+      setStatus('connecting');
+
+      // Drop the connection ourselves; the device restarts about a second after the write
+      cleanupConnection();
+      try {
+        await manager.cancelDeviceConnection(id);
+      } catch {
+        // already gone
+      }
+      setConnected(null);
+      resetReading();
+
+      try {
+        await new Promise((r) => setTimeout(r, 2500)); // give it time to boot
+        const dev = await findDevice(id, 20000);
+        await connect(dev);
+      } catch (e: any) {
+        setError(e?.message ?? 'Could not reconnect after renaming.');
+        setStatus('idle');
+      } finally {
+        renamingRef.current = false;
+        setReconnecting(false);
+      }
+    },
+    [connected, cleanupConnection, resetReading, connect]
+  );
+
+  const confirmRename = useCallback(() => {
+    const name = renameText.trim();
+    if (!name) {
+      setRenameError('The name cannot be empty.');
+      return;
+    }
+    if (utf8Length(name) > MAX_NAME_LEN) {
+      setRenameError(
+        `Name is too long (max ${MAX_NAME_LEN} bytes; special characters take more than one).`
+      );
+      return;
+    }
+    renameDevice(name);
+  }, [renameText, renameDevice]);
+
+  const openMenu = useCallback(() => {
+    menuBtnRef.current?.measureInWindow((_x, y, _w, h) => {
+      setMenuTop(y + h + 6);
+      setMenuOpen(true);
+    });
+  }, []);
+
+  const openRename = useCallback(() => {
+    setMenuOpen(false);
+    setRenameText(displayName ?? '');
+    setRenameError(null);
+    setRenameOpen(true);
+  }, [displayName]);
+
   useEffect(() => {
     return () => {
       manager.stopDeviceScan();
@@ -242,6 +412,7 @@ export default function App() {
   }, [cleanupConnection]);
 
   const isConnected = status === 'connected' && connected;
+  const renameUnchanged = renameText.trim() === (displayName ?? '');
 
   return (
     <SafeAreaProvider>
@@ -250,19 +421,29 @@ export default function App() {
 
         <View style={styles.header}>
           <Text style={styles.title}>Magneto Sensor</Text>
-          {isConnected && (
-            <Pressable style={styles.disconnectBtn} onPress={disconnect}>
-              <Text style={styles.disconnectText}>Disconnect</Text>
+          {isConnected && !reconnecting && (
+            <Pressable
+              ref={menuBtnRef}
+              collapsable={false}
+              style={styles.menuBtn}
+              onPress={openMenu}
+            >
+              <Text style={styles.menuBtnText}>Options ▾</Text>
             </Pressable>
           )}
         </View>
 
         {error && <Text style={styles.error}>{error}</Text>}
 
-        {isConnected ? (
+        {reconnecting ? (
+          <View style={styles.readingWrap}>
+            <ActivityIndicator color="#fff" size="large" />
+            <Text style={styles.hint}>Renaming and reconnecting…</Text>
+          </View>
+        ) : isConnected ? (
           <View style={styles.readingWrap}>
             <Text style={styles.deviceName}>
-              {connected.name ?? connected.localName ?? connected.id}
+              {displayName ?? connected.name ?? connected.localName ?? connected.id}
             </Text>
             <View style={styles.card}>
               <Text style={styles.label}>Magnetic field</Text>
@@ -360,6 +541,87 @@ export default function App() {
             />
           </View>
         )}
+
+        {/* Options dropdown */}
+        <Modal
+          transparent
+          visible={menuOpen}
+          animationType="fade"
+          statusBarTranslucent
+          onRequestClose={() => setMenuOpen(false)}
+        >
+          <Pressable style={styles.menuBackdrop} onPress={() => setMenuOpen(false)}>
+            <View style={[styles.dropdown, { top: menuTop }]}>
+              <Pressable style={styles.menuItem} onPress={openRename}>
+                <Text style={styles.menuItemText}>Rename device</Text>
+              </Pressable>
+              <View style={styles.menuDivider} />
+              <Pressable style={styles.menuItem} onPress={disconnect}>
+                <Text style={[styles.menuItemText, styles.menuItemDanger]}>
+                  Disconnect
+                </Text>
+              </Pressable>
+            </View>
+          </Pressable>
+        </Modal>
+
+        {/* Rename dialog */}
+        {renameOpen && (
+          <KeyboardAvoidingView
+            style={styles.overlay}
+            behavior={Platform.OS === 'ios' ? 'padding' : undefined}
+          >
+            <View style={styles.dialog}>
+              <Text style={styles.dialogTitle}>Rename device</Text>
+              <TextInput
+                style={styles.input}
+                value={renameText}
+                onChangeText={(t) => {
+                  setRenameText(t);
+                  setRenameError(null);
+                }}
+                maxLength={MAX_NAME_LEN}
+                autoFocus
+                autoCorrect={false}
+                selectTextOnFocus
+                editable={!renameBusy}
+                placeholder="New device name"
+                placeholderTextColor="#64748b"
+                returnKeyType="done"
+                onSubmitEditing={confirmRename}
+              />
+              <Text style={styles.counter}>
+                {renameText.length}/{MAX_NAME_LEN}
+              </Text>
+              {renameError && <Text style={styles.dialogError}>{renameError}</Text>}
+              <View style={styles.dialogButtons}>
+                <Pressable
+                  style={[styles.dialogBtn, styles.dialogCancel]}
+                  disabled={renameBusy}
+                  onPress={() => setRenameOpen(false)}
+                >
+                  <Text style={styles.buttonText}>Cancel</Text>
+                </Pressable>
+                <Pressable
+                  style={[
+                    styles.dialogBtn,
+                    styles.dialogPrimary,
+                    (renameBusy || !renameText.trim() || renameUnchanged) &&
+                      styles.disabled,
+                  ]}
+                  disabled={renameBusy || !renameText.trim() || renameUnchanged}
+                  onPress={confirmRename}
+                >
+                  {renameBusy ? (
+                    <ActivityIndicator color="#fff" />
+                  ) : (
+                    <Text style={styles.buttonText}>Rename</Text>
+                  )}
+                </Pressable>
+              </View>
+            </View>
+          </KeyboardAvoidingView>
+        )}
       </SafeAreaView>
     </SafeAreaProvider>
   );
@@ -374,13 +636,31 @@ const styles = StyleSheet.create({
     marginVertical: 16,
   },
   title: { color: '#f8fafc', fontSize: 26, fontWeight: '700' },
-  disconnectBtn: {
-    backgroundColor: '#dc2626',
+  menuBtn: {
+    backgroundColor: '#1e293b',
+    borderWidth: 1,
+    borderColor: '#334155',
     paddingVertical: 8,
     paddingHorizontal: 14,
     borderRadius: 8,
   },
-  disconnectText: { color: '#fff', fontSize: 14, fontWeight: '600' },
+  menuBtnText: { color: '#f8fafc', fontSize: 14, fontWeight: '600' },
+  menuBackdrop: { flex: 1 },
+  dropdown: {
+    position: 'absolute',
+    right: 20,
+    minWidth: 180,
+    backgroundColor: '#1e293b',
+    borderWidth: 1,
+    borderColor: '#334155',
+    borderRadius: 10,
+    overflow: 'hidden',
+    elevation: 8,
+  },
+  menuItem: { paddingVertical: 14, paddingHorizontal: 16 },
+  menuItemText: { color: '#f1f5f9', fontSize: 16 },
+  menuItemDanger: { color: '#f87171' },
+  menuDivider: { height: StyleSheet.hairlineWidth, backgroundColor: '#334155' },
   error: {
     color: '#fecaca',
     backgroundColor: '#7f1d1d',
@@ -427,4 +707,34 @@ const styles = StyleSheet.create({
   value: { color: '#f8fafc', fontSize: 45, fontWeight: '700', marginVertical: 8 },
   unit: { fontSize: 28, color: '#94a3b8', fontWeight: '500' },
   updated: { color: '#64748b', fontSize: 12 },
+  overlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(0,0,0,0.65)',
+    justifyContent: 'center',
+    paddingHorizontal: 20,
+  },
+  dialog: { backgroundColor: '#1e293b', borderRadius: 16, padding: 20 },
+  dialogTitle: { color: '#f8fafc', fontSize: 20, fontWeight: '700', marginBottom: 14 },
+  input: {
+    backgroundColor: '#0f172a',
+    color: '#f8fafc',
+    borderWidth: 1,
+    borderColor: '#334155',
+    borderRadius: 8,
+    padding: 12,
+    fontSize: 16,
+  },
+  counter: { color: '#64748b', fontSize: 12, textAlign: 'right', marginTop: 6 },
+  dialogError: { color: '#fca5a5', fontSize: 13, marginTop: 8 },
+  dialogButtons: { flexDirection: 'row', justifyContent: 'flex-end', marginTop: 16 },
+  dialogBtn: {
+    minWidth: 90,
+    paddingVertical: 10,
+    paddingHorizontal: 16,
+    borderRadius: 8,
+    alignItems: 'center',
+    marginLeft: 10,
+  },
+  dialogCancel: { backgroundColor: '#334155' },
+  dialogPrimary: { backgroundColor: '#2563eb' },
 });
