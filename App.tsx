@@ -1,7 +1,10 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  AppState,
+  BackHandler,
   FlatList,
+  Keyboard,
   KeyboardAvoidingView,
   Modal,
   PermissionsAndroid,
@@ -17,6 +20,7 @@ import {
 import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { BleManager, Device, State, Subscription } from 'react-native-ble-plx';
 import { decode, encode } from 'base-64';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 
 // Must match the UUIDs in the Arduino sketch
 const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
@@ -25,6 +29,9 @@ const NAME_CHAR_UUID = '6e400003-b5a3-f393-e0a9-e50e24dcca9e'; // device name (r
 
 const TARE_SAMPLES = 5;
 const MAX_NAME_LEN = 29; // must match MAX_NAME_LEN in the Arduino sketch
+const DEFAULT_PRECISION = 5; // digits after the decimal point
+const MAX_PRECISION = 10;
+const PRECISION_KEY = 'settings:precision';
 
 // Single manager instance for the whole app
 const manager = new BleManager();
@@ -81,29 +88,41 @@ function utf8Length(s: string): number {
   return unescape(encodeURIComponent(s)).length;
 }
 
+const CANCELLED = 'cancelled';
+let cancelActiveFind: (() => void) | null = null;
+
 // Scan until the device with the given id shows up again (e.g. after it reboots)
 function findDevice(id: string, timeoutMs: number): Promise<Device> {
   return new Promise((resolve, reject) => {
-    const timer = setTimeout(() => {
+    let timer: ReturnType<typeof setTimeout>;
+    const finish = () => {
+      clearTimeout(timer);
       manager.stopDeviceScan();
+      if (cancelActiveFind === cancel) cancelActiveFind = null;
+    };
+    const cancel = () => {
+      finish();
+      reject(new Error(CANCELLED));
+    };
+    timer = setTimeout(() => {
+      finish();
       reject(
-        new Error('Could not find the device after renaming. Please scan again.')
+        new Error('Could not find the device. Please scan again.')
       );
     }, timeoutMs);
+    cancelActiveFind = cancel;
 
     manager.startDeviceScan(
       [SERVICE_UUID],
       { allowDuplicates: false },
       (err, device) => {
         if (err) {
-          clearTimeout(timer);
-          manager.stopDeviceScan();
+          finish();
           reject(err);
           return;
         }
         if (device && device.id === id) {
-          clearTimeout(timer);
-          manager.stopDeviceScan();
+          finish();
           resolve(device);
         }
       }
@@ -135,8 +154,22 @@ export default function App() {
   const [renameError, setRenameError] = useState<string | null>(null);
   const [renameBusy, setRenameBusy] = useState(false);
   const [reconnecting, setReconnecting] = useState(false);
+  const [reconnectMsg, setReconnectMsg] = useState('Reconnecting…');
+
+  // Settings screen
+  const [screen, setScreen] = useState<'main' | 'settings'>('main');
+  const [precision, setPrecision] = useState(DEFAULT_PRECISION);
+  const [precisionText, setPrecisionText] = useState(String(DEFAULT_PRECISION));
+  const [precisionError, setPrecisionError] = useState<string | null>(null);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
   const renamingRef = useRef(false);
   const pendingRenameRef = useRef(false); // iOS: open rename after the menu modal is gone
+  // Background/foreground handling
+  const connectedRef = useRef<Device | null>(null);
+  const offsetRef = useRef(0);
+  const resumeIdRef = useRef<string | null>(null); // device to reconnect to on foreground
+  const resumeOffsetRef = useRef(0);
+  const resumingRef = useRef(false);
 
   const monitorSub = useRef<Subscription | null>(null);
   const disconnectSub = useRef<Subscription | null>(null);
@@ -268,6 +301,7 @@ export default function App() {
         );
 
         setOffset(0); // fresh connection starts untared
+        connectedRef.current = d;
         setConnected(d);
         setStatus('connected');
       } catch (e: any) {
@@ -348,6 +382,7 @@ export default function App() {
       setRenameBusy(false);
       setRenameOpen(false);
       setError(null);
+      setReconnectMsg('Renaming and reconnecting…');
       setReconnecting(true);
       setStatus('connecting');
 
@@ -411,6 +446,156 @@ export default function App() {
     }
   }, [displayName]);
 
+  const openSettings = useCallback(() => {
+    setMenuOpen(false);
+    setPrecisionText(String(precision));
+    setPrecisionError(null);
+    setScreen('settings');
+  }, [precision]);
+
+  const closeSettings = useCallback(() => {
+    Keyboard.dismiss();
+    setPrecisionError(null);
+    setScreen('main');
+  }, []);
+
+  const onPrecisionChange = (t: string) => {
+    const digits = t.replace(/[^0-9]/g, '');
+    setPrecisionText(digits);
+    const n = parseInt(digits, 10);
+    if (digits === '' || n > MAX_PRECISION) {
+      setPrecisionError(`Enter a number between 0 and ${MAX_PRECISION}.`);
+      return; // keep the last valid precision
+    }
+    setPrecisionError(null);
+    setPrecision(n);
+  };
+
+  const onPrecisionBlur = () => {
+    // Snap the field back to the precision actually in use
+    setPrecisionText(String(precision));
+    setPrecisionError(null);
+  };
+
+  // Leave the settings screen if the connection goes away
+  useEffect(() => {
+    if (status !== 'connected' && !reconnecting) setScreen('main');
+  }, [status, reconnecting]);
+
+  // Android back button returns from settings
+  useEffect(() => {
+    if (screen !== 'settings') return;
+    const sub = BackHandler.addEventListener('hardwareBackPress', () => {
+      closeSettings();
+      return true;
+    });
+    return () => sub.remove();
+  }, [screen, closeSettings]);
+
+  // Load the saved precision once at startup
+  useEffect(() => {
+    (async () => {
+      try {
+        const saved = await AsyncStorage.getItem(PRECISION_KEY);
+        if (saved !== null) {
+          const n = parseInt(saved, 10);
+          if (Number.isInteger(n) && n >= 0 && n <= MAX_PRECISION) {
+            setPrecision(n);
+            setPrecisionText(String(n));
+          }
+        }
+      } catch {
+        // storage unavailable: just use the default
+      } finally {
+        setSettingsLoaded(true);
+      }
+    })();
+  }, []);
+
+  // Save whenever it changes (but not before the saved value has been loaded)
+  useEffect(() => {
+    if (!settingsLoaded) return;
+    AsyncStorage.setItem(PRECISION_KEY, String(precision)).catch(() => {});
+  }, [precision, settingsLoaded]);
+
+  // Keep refs in sync so AppState handlers always see current values
+  useEffect(() => {
+    connectedRef.current = connected;
+  }, [connected]);
+  useEffect(() => {
+    offsetRef.current = offset;
+  }, [offset]);
+
+  // App went to the background: drop the BLE connection and remember the device
+  const suspendConnection = useCallback(async () => {
+    if (renamingRef.current) return;
+    if (resumingRef.current) {
+      // Still reconnecting; stop the scan and try again on next foreground
+      cancelActiveFind?.();
+      return;
+    }
+    const d = connectedRef.current;
+    if (!d) return;
+
+    resumeIdRef.current = d.id;
+    resumeOffsetRef.current = offsetRef.current;
+
+    cleanupConnection(); // removes the disconnect listener, so no error banner
+    connectedRef.current = null;
+    setMenuOpen(false);
+    setRenameOpen(false);
+    setConnected(null);
+    resetReading();
+    setStatus('idle');
+    try {
+      await manager.cancelDeviceConnection(d.id);
+    } catch {
+      // already disconnected
+    }
+  }, [cleanupConnection, resetReading]);
+
+  // App is back in the foreground: find the same device again and reconnect
+  const resumeConnection = useCallback(async () => {
+    const id = resumeIdRef.current;
+    if (!id || resumingRef.current) return;
+
+    resumingRef.current = true;
+    setError(null);
+    setReconnectMsg('Reconnecting…');
+    setReconnecting(true);
+    setStatus('connecting');
+
+    try {
+      // Give the ESP32 a moment to resume advertising after our disconnect
+      await new Promise((r) => setTimeout(r, 500));
+      const dev = await findDevice(id, 15000);
+      resumeIdRef.current = null;
+      await connect(dev);
+      if (connectedRef.current) setOffset(resumeOffsetRef.current); // keep the tare
+    } catch (e: any) {
+      if (e?.message === CANCELLED) {
+        setStatus('idle'); // resume id is kept for the next foreground
+      } else {
+        resumeIdRef.current = null;
+        setError(e?.message ?? 'Could not reconnect.');
+        setStatus('idle');
+      }
+    } finally {
+      resumingRef.current = false;
+      setReconnecting(false);
+      // Backgrounded again while we were reconnecting
+      if (AppState.currentState !== 'active') suspendConnection();
+    }
+  }, [connect, suspendConnection]);
+
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', (next) => {
+      if (next === 'background') suspendConnection();
+      else if (next === 'active') resumeConnection();
+    });
+    return () => sub.remove();
+  }, [suspendConnection, resumeConnection]);
+
   useEffect(() => {
     return () => {
       manager.stopDeviceScan();
@@ -419,6 +604,7 @@ export default function App() {
   }, [cleanupConnection]);
 
   const isConnected = status === 'connected' && connected;
+  const inSettings = screen === 'settings' && !!isConnected && !reconnecting;
   const renameUnchanged = renameText.trim() === (displayName ?? '');
 
   return (
@@ -427,8 +613,14 @@ export default function App() {
         <StatusBar barStyle="light-content" />
 
         <View style={styles.header}>
-          <Text style={styles.title}>Magneto Sensor</Text>
-          {isConnected && !reconnecting && (
+          {inSettings && (
+            <Pressable style={styles.backBtn} onPress={closeSettings}>
+              <Text style={styles.menuBtnText}>‹ Back</Text>
+            </Pressable>
+          )}
+          <Text style={styles.title}>{inSettings ? 'Settings' : 'Magneto Sensor'}</Text>
+          {inSettings && <View style={styles.backBtnSpacer} />}
+          {isConnected && !reconnecting && !inSettings && (
             <Pressable
               ref={menuBtnRef}
               collapsable={false}
@@ -445,8 +637,32 @@ export default function App() {
         {reconnecting ? (
           <View style={styles.readingWrap}>
             <ActivityIndicator color="#fff" size="large" />
-            <Text style={styles.hint}>Renaming and reconnecting…</Text>
+            <Text style={styles.hint}>{reconnectMsg}</Text>
           </View>
+        ) : inSettings ? (
+          <Pressable style={styles.settingsWrap} onPress={Keyboard.dismiss}>
+            <View style={styles.settingRow}>
+              <View style={{ flex: 1, paddingRight: 12 }}>
+                <Text style={styles.settingLabel}>Display precision</Text>
+                <Text style={styles.settingHint}>
+                  Digits after the decimal point (0–{MAX_PRECISION})
+                </Text>
+              </View>
+              <TextInput
+                style={styles.settingInput}
+                value={precisionText}
+                onChangeText={onPrecisionChange}
+                onBlur={onPrecisionBlur}
+                keyboardType="number-pad"
+                maxLength={2}
+                selectTextOnFocus
+              />
+            </View>
+            {precisionError && <Text style={styles.dialogError}>{precisionError}</Text>}
+            <Text style={[styles.settingHint, { marginTop: 16 }]}>
+              Current reading: {value !== null ? value.toFixed(precision) : '—'} G
+            </Text>
+          </Pressable>
         ) : isConnected ? (
           <View style={styles.readingWrap}>
             <Text style={styles.deviceName}>
@@ -455,7 +671,7 @@ export default function App() {
             <View style={styles.card}>
               <Text style={styles.label}>Magnetic field</Text>
               <Text style={styles.value}>
-                {value !== null ? value.toFixed(5) : '—'}
+                {value !== null ? value.toFixed(precision) : '—'}
                 <Text style={styles.unit}> G</Text>
               </Text>
               <Text style={styles.updated}>
@@ -464,7 +680,7 @@ export default function App() {
                   : 'Waiting for data…'}
               </Text>
               {offset !== 0 && (
-                <Text style={styles.updated}>Tared (offset {offset.toFixed(5)} G)</Text>
+                <Text style={styles.updated}>Tared (offset {offset.toFixed(precision)} G)</Text>
               )}
             </View>
             <Pressable
@@ -569,6 +785,10 @@ export default function App() {
                 <Text style={styles.menuItemText}>Rename device</Text>
               </Pressable>
               <View style={styles.menuDivider} />
+              <Pressable style={styles.menuItem} onPress={openSettings}>
+                <Text style={styles.menuItemText}>Settings</Text>
+              </Pressable>
+              <View style={styles.menuDivider} />
               <Pressable style={styles.menuItem} onPress={disconnect}>
                 <Text style={[styles.menuItemText, styles.menuItemDanger]}>
                   Disconnect
@@ -666,6 +886,29 @@ const styles = StyleSheet.create({
     borderRadius: 8,
   },
   menuBtnText: { color: '#f8fafc', fontSize: 14, fontWeight: '600' },
+  backBtn: { width: 80, paddingVertical: 8 },
+  backBtnSpacer: { width: 80 },
+  settingsWrap: { flex: 1 },
+  settingRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: '#1e293b',
+    borderRadius: 12,
+    padding: 16,
+  },
+  settingLabel: { color: '#f1f5f9', fontSize: 16, fontWeight: '600' },
+  settingHint: { color: '#94a3b8', fontSize: 13, marginTop: 2 },
+  settingInput: {
+    width: 70,
+    backgroundColor: '#0f172a',
+    color: '#f8fafc',
+    borderWidth: 1,
+    borderColor: '#334155',
+    borderRadius: 8,
+    paddingVertical: 10,
+    fontSize: 18,
+    textAlign: 'center',
+  },
   menuBackdrop: { flex: 1 },
   dropdown: {
     position: 'absolute',
