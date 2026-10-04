@@ -21,6 +21,7 @@ import { SafeAreaProvider, SafeAreaView } from 'react-native-safe-area-context';
 import { BleManager, Device, State, Subscription } from 'react-native-ble-plx';
 import { decode, encode } from 'base-64';
 import AsyncStorage from '@react-native-async-storage/async-storage';
+import { setAudioModeAsync, useAudioPlayer } from 'expo-audio';
 
 // Must match the UUIDs in the Arduino sketch
 const SERVICE_UUID = '4fafc201-1fb5-459e-8fcc-c5c9c331914b';
@@ -32,6 +33,9 @@ const MAX_NAME_LEN = 29; // must match MAX_NAME_LEN in the Arduino sketch
 const DEFAULT_PRECISION = 5; // digits after the decimal point
 const MAX_PRECISION = 10;
 const PRECISION_KEY = 'settings:precision';
+const ALARM_KEY = 'settings:alarm';
+const DEFAULT_THRESHOLD = 1; // Gauss
+const BEEP_INTERVAL_MS = 400;
 
 // Single manager instance for the whole app
 const manager = new BleManager();
@@ -148,7 +152,6 @@ function findDevice(id: string, timeoutMs: number): Promise<Device> {
 export default function App() {
   const [status, setStatus] = useState<Status>('idle');
   const [devices, setDevices] = useState<Device[]>([]);
-  const [showAll, setShowAll] = useState(false);
   const [connected, setConnected] = useState<Device | null>(null);
   const [displayName, setDisplayName] = useState<string | null>(null);
   // rawValue is exactly what the sensor sent; the displayed value is rawValue - offset
@@ -176,6 +179,10 @@ export default function App() {
   const [precision, setPrecision] = useState(DEFAULT_PRECISION);
   const [precisionText, setPrecisionText] = useState(String(DEFAULT_PRECISION));
   const [precisionError, setPrecisionError] = useState<string | null>(null);
+  const [alarmEnabled, setAlarmEnabled] = useState(false);
+  const [threshold, setThreshold] = useState(DEFAULT_THRESHOLD);
+  const [thresholdText, setThresholdText] = useState(String(DEFAULT_THRESHOLD));
+  const [thresholdError, setThresholdError] = useState<string | null>(null);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const renamingRef = useRef(false);
   const pendingRenameRef = useRef(false); // iOS: open rename after the menu modal is gone
@@ -188,6 +195,20 @@ export default function App() {
   const disconnectSub = useRef<Subscription | null>(null);
 
   const value = rawValue !== null ? rawValue - offset : null;
+
+  const beepPlayer = useAudioPlayer(require('./assets/beep.wav'));
+  const playBeep = useCallback(() => {
+    try {
+      beepPlayer.seekTo(0);
+      beepPlayer.play();
+    } catch {
+      // ignore playback errors
+    }
+  }, [beepPlayer]);
+
+  // Alarm is active while |value| is above the threshold (not during the tare itself)
+  const alarmActive =
+    alarmEnabled && !taring && value !== null && Math.abs(value) > threshold;
 
   const resetReading = useCallback(() => {
     setRawValue(null);
@@ -218,7 +239,7 @@ export default function App() {
 
     setStatus('scanning');
     manager.startDeviceScan(
-      showAll ? null : [SERVICE_UUID],
+      [SERVICE_UUID],
       { allowDuplicates: false },
       (err, device) => {
         if (err) {
@@ -238,7 +259,12 @@ export default function App() {
       manager.stopDeviceScan();
       setStatus((s) => (s === 'scanning' ? 'idle' : s));
     }, 15000);
-  }, [showAll]);
+  }, []);
+
+  // Start scanning as soon as the app opens
+  useEffect(() => {
+    startScan();
+  }, [startScan]);
 
   const cleanupConnection = useCallback(() => {
     monitorSub.current?.remove();
@@ -469,12 +495,15 @@ export default function App() {
     setMenuOpen(false);
     setPrecisionText(String(precision));
     setPrecisionError(null);
+    setThresholdText(String(threshold));
+    setThresholdError(null);
     setScreen('settings');
-  }, [precision]);
+  }, [precision, threshold]);
 
   const closeSettings = useCallback(() => {
     Keyboard.dismiss();
     setPrecisionError(null);
+    setThresholdError(null);
     setScreen('main');
   }, []);
 
@@ -494,6 +523,27 @@ export default function App() {
     // Snap the field back to the precision actually in use
     setPrecisionText(String(precision));
     setPrecisionError(null);
+  };
+
+  const onThresholdChange = (t: string) => {
+    let clean = t.replace(/,/g, '.').replace(/[^0-9.]/g, '');
+    const dot = clean.indexOf('.');
+    if (dot !== -1) {
+      clean = clean.slice(0, dot + 1) + clean.slice(dot + 1).replace(/\./g, '');
+    }
+    setThresholdText(clean);
+    const n = parseFloat(clean);
+    if (!Number.isFinite(n)) {
+      setThresholdError('Enter a number, e.g. 1.5');
+      return; // keep the last valid threshold
+    }
+    setThresholdError(null);
+    setThreshold(n);
+  };
+
+  const onThresholdBlur = () => {
+    setThresholdText(String(threshold));
+    setThresholdError(null);
   };
 
   // Leave the settings screen if the connection goes away
@@ -523,6 +573,15 @@ export default function App() {
             setPrecisionText(String(n));
           }
         }
+        const rawAlarm = await AsyncStorage.getItem(ALARM_KEY);
+        if (rawAlarm) {
+          const a = JSON.parse(rawAlarm);
+          if (typeof a.enabled === 'boolean') setAlarmEnabled(a.enabled);
+          if (typeof a.threshold === 'number' && Number.isFinite(a.threshold) && a.threshold >= 0) {
+            setThreshold(a.threshold);
+            setThresholdText(String(a.threshold));
+          }
+        }
       } catch {
         // storage unavailable: just use the default
       } finally {
@@ -536,6 +595,27 @@ export default function App() {
     if (!settingsLoaded) return;
     AsyncStorage.setItem(PRECISION_KEY, String(precision)).catch(() => {});
   }, [precision, settingsLoaded]);
+
+  useEffect(() => {
+    if (!settingsLoaded) return;
+    AsyncStorage.setItem(
+      ALARM_KEY,
+      JSON.stringify({ enabled: alarmEnabled, threshold })
+    ).catch(() => {});
+  }, [alarmEnabled, threshold, settingsLoaded]);
+
+  // Let the beep play even if the iPhone is in silent mode
+  useEffect(() => {
+    setAudioModeAsync({ playsInSilentMode: true }).catch(() => {});
+  }, []);
+
+  // Beep repeatedly while the threshold is exceeded
+  useEffect(() => {
+    if (!alarmActive) return;
+    playBeep();
+    const id = setInterval(playBeep, BEEP_INTERVAL_MS);
+    return () => clearInterval(id);
+  }, [alarmActive, playBeep]);
 
   // Keep refs in sync so AppState handlers always see current values
   useEffect(() => {
@@ -673,6 +753,40 @@ export default function App() {
               />
             </View>
             {precisionError && <Text style={styles.dialogError}>{precisionError}</Text>}
+            <View style={[styles.settingRow, { marginTop: 12 }]}>
+              <View style={{ flex: 1, paddingRight: 12 }}>
+                <Text style={styles.settingLabel}>Beep alarm</Text>
+                <Text style={styles.settingHint}>
+                  Beep while the field is above the threshold
+                </Text>
+              </View>
+              <Switch value={alarmEnabled} onValueChange={setAlarmEnabled} />
+            </View>
+            <View
+              style={[
+                styles.settingRow,
+                { marginTop: 12 },
+                !alarmEnabled && styles.disabled,
+              ]}
+            >
+              <View style={{ flex: 1, paddingRight: 12 }}>
+                <Text style={styles.settingLabel}>Threshold</Text>
+                <Text style={styles.settingHint}>
+                  Gauss, absolute value after tare
+                </Text>
+              </View>
+              <TextInput
+                style={styles.settingInput}
+                value={thresholdText}
+                onChangeText={onThresholdChange}
+                onBlur={onThresholdBlur}
+                keyboardType="decimal-pad"
+                maxLength={8}
+                editable={alarmEnabled}
+                selectTextOnFocus
+              />
+            </View>
+            {thresholdError && <Text style={styles.dialogError}>{thresholdError}</Text>}
             <Text style={[styles.settingHint, { marginTop: 16 }]}>
               Current reading: {value !== null ? value.toFixed(precision) : '—'} G
             </Text>
@@ -684,7 +798,7 @@ export default function App() {
             </Text>
             <View style={styles.card}>
               <Text style={styles.label}>Magnetic field</Text>
-              <Text style={styles.value}>
+              <Text style={[styles.value, alarmActive && styles.valueAlert]}>
                 {value !== null ? value.toFixed(precision) : '—'}
                 <Text style={styles.unit}> G</Text>
               </Text>
@@ -714,15 +828,6 @@ export default function App() {
           </View>
         ) : (
           <View style={styles.listWrap}>
-            <View style={styles.row}>
-              <Text style={styles.rowLabel}>Show all BLE devices</Text>
-              <Switch
-                value={showAll}
-                onValueChange={setShowAll}
-                disabled={status === 'scanning' || status === 'connecting'}
-              />
-            </View>
-
             <Pressable
               style={[
                 styles.button,
@@ -947,13 +1052,6 @@ const styles = StyleSheet.create({
     marginBottom: 12,
   },
   listWrap: { flex: 1 },
-  row: {
-    flexDirection: 'row',
-    justifyContent: 'space-between',
-    alignItems: 'center',
-    marginBottom: 12,
-  },
-  rowLabel: { color: '#cbd5e1', fontSize: 15 },
   inline: { flexDirection: 'row', alignItems: 'center', justifyContent: 'center' },
   button: {
     backgroundColor: '#2563eb',
@@ -983,6 +1081,7 @@ const styles = StyleSheet.create({
   },
   label: { color: '#94a3b8', fontSize: 14, textTransform: 'uppercase', letterSpacing: 1 },
   value: { color: '#f8fafc', fontSize: 45, fontWeight: '700', marginVertical: 8 },
+  valueAlert: { color: '#f87171' },
   unit: { fontSize: 28, color: '#94a3b8', fontWeight: '500' },
   updated: { color: '#64748b', fontSize: 12 },
   overlay: {
