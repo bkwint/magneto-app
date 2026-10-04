@@ -68,6 +68,21 @@ function parseValue(base64: string | null): number | null {
   }
 }
 
+// Read TARE_SAMPLES raw values from the sensor and return their average (null if none were valid)
+async function measureTareOffset(device: Device): Promise<number | null> {
+  const samples: number[] = [];
+  for (let i = 0; i < TARE_SAMPLES; i++) {
+    const c = await device.readCharacteristicForService(
+      SERVICE_UUID,
+      CHARACTERISTIC_UUID
+    );
+    const v = parseValue(c.value);
+    if (v !== null) samples.push(v);
+  }
+  if (samples.length === 0) return null;
+  return samples.reduce((a, b) => a + b, 0) / samples.length;
+}
+
 // UTF-8 <-> base64 helpers for the device name
 function toBase64Utf8(s: string): string {
   return encode(unescape(encodeURIComponent(s)));
@@ -166,9 +181,7 @@ export default function App() {
   const pendingRenameRef = useRef(false); // iOS: open rename after the menu modal is gone
   // Background/foreground handling
   const connectedRef = useRef<Device | null>(null);
-  const offsetRef = useRef(0);
   const resumeIdRef = useRef<string | null>(null); // device to reconnect to on foreground
-  const resumeOffsetRef = useRef(0);
   const resumingRef = useRef(false);
 
   const monitorSub = useRef<Subscription | null>(null);
@@ -304,6 +317,21 @@ export default function App() {
         connectedRef.current = d;
         setConnected(d);
         setStatus('connected');
+
+        // Always start a connection tared
+        setTaring(true);
+        try {
+          const avg = await measureTareOffset(d);
+          if (avg !== null) setOffset(avg);
+          else setError('Auto-tare failed: no valid readings received.');
+        } catch (e: any) {
+          // Ignore if the device went away mid-tare; otherwise report it
+          if (connectedRef.current === d) {
+            setError(e?.message ?? 'Auto-tare failed.');
+          }
+        } finally {
+          setTaring(false);
+        }
       } catch (e: any) {
         cleanupConnection();
         setError(e?.message ?? 'Failed to connect.');
@@ -334,20 +362,11 @@ export default function App() {
     setError(null);
     setTaring(true);
     try {
-      const samples: number[] = [];
-      for (let i = 0; i < TARE_SAMPLES; i++) {
-        const c = await connected.readCharacteristicForService(
-          SERVICE_UUID,
-          CHARACTERISTIC_UUID
-        );
-        const v = parseValue(c.value);
-        if (v !== null) samples.push(v);
-      }
-      if (samples.length === 0) {
+      const avg = await measureTareOffset(connected);
+      if (avg === null) {
         setError('Tare failed: no valid readings received.');
         return;
       }
-      const avg = samples.reduce((a, b) => a + b, 0) / samples.length;
       setOffset(avg);
     } catch (e: any) {
       setError(e?.message ?? 'Tare failed.');
@@ -522,9 +541,6 @@ export default function App() {
   useEffect(() => {
     connectedRef.current = connected;
   }, [connected]);
-  useEffect(() => {
-    offsetRef.current = offset;
-  }, [offset]);
 
   // App went to the background: drop the BLE connection and remember the device
   const suspendConnection = useCallback(async () => {
@@ -538,7 +554,6 @@ export default function App() {
     if (!d) return;
 
     resumeIdRef.current = d.id;
-    resumeOffsetRef.current = offsetRef.current;
 
     cleanupConnection(); // removes the disconnect listener, so no error banner
     connectedRef.current = null;
@@ -571,7 +586,6 @@ export default function App() {
       const dev = await findDevice(id, 15000);
       resumeIdRef.current = null;
       await connect(dev);
-      if (connectedRef.current) setOffset(resumeOffsetRef.current); // keep the tare
     } catch (e: any) {
       if (e?.message === CANCELLED) {
         setStatus('idle'); // resume id is kept for the next foreground
